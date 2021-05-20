@@ -41,7 +41,7 @@ public:
 
 private:
   ros::NodeHandle nh_, private_nh_;
-  bool pub_odom_tf_;
+  bool pub_odom_tf_, init_diff_  = false;
   std::string cmd_topic_name_;
   std::string base_frame_id_;
   std::string nmea_frame_id_;
@@ -91,7 +91,7 @@ NmeaToOdomNode::NmeaToOdomNode(ros::NodeHandle nh, ros::NodeHandle private_nh)
   nmea_point_sub_ = new message_filters::Subscriber<nmea_ros_driver::GPSPoint>(nh_, "/gps/point", 5);
   nmea_rpy_sub_ = new message_filters::Subscriber<nmea_ros_driver::GPSRPY>(nh_, "/gps/rpy", 5);
   nmea_sub_ = new message_filters::Subscriber<sensor_msgs::NavSatFix>(nh_, "/gps/fixed", 5);
-  emna_sync_ = new message_filters::Synchronizer<nmeaSyncPolicy>(nmeaSyncPolicy(5), *nmea_sub_, *nmea_point_sub_, *nmea_rpy_sub_);
+  emna_sync_ = new message_filters::Synchronizer<nmeaSyncPolicy>(nmeaSyncPolicy(10), *nmea_sub_, *nmea_point_sub_, *nmea_rpy_sub_);
   emna_sync_->registerCallback(boost::bind(&NmeaToOdomNode::NmeaCallBack, this, _1, _2, _3));
 
   odom_pub_ = nh_.advertise<nav_msgs::Odometry>("/gps/odom", 5);
@@ -104,7 +104,7 @@ void NmeaToOdomNode::NmeaCallBack(const sensor_msgs::NavSatFix::ConstPtr &gps,
                                   const nmea_ros_driver::GPSRPY::ConstPtr &rpy)
 {
   static bool first_msg_flage = true;
-  static double init_x(0.0), init_y(0.0), init_z(0.0), init_th(0.0);
+  static double init_x(0.0), init_y(0.0), init_z(0.0), init_th(0.0), gps_base_x, gps_base_y;
   static tf::StampedTransform nmea_rt;
 
   if (first_msg_flage)
@@ -124,6 +124,8 @@ void NmeaToOdomNode::NmeaCallBack(const sensor_msgs::NavSatFix::ConstPtr &gps,
     {
       tf_.lookupTransform(base_frame_id_, nmea_frame_id_, ros::Time(0), nmea_rt);
       ROS_INFO_STREAM("Get " << base_frame_id_ << " form " << nmea_frame_id_ << " successful!");
+      gps_base_x = nmea_rt.getOrigin().getX();
+      gps_base_y = nmea_rt.getOrigin().getY();
       first_msg_flage = false;
     }
     else
@@ -167,8 +169,28 @@ void NmeaToOdomNode::NmeaCallBack(const sensor_msgs::NavSatFix::ConstPtr &gps,
     gps_th = (360.0 - rpy->y) * 3.1415926 / 180.0;
   }
   
-  double x = gps_x ;//- nmea_rt.getOrigin().getX();
-  double y = gps_y ;//- nmea_rt.getOrigin().getY();
+  float rad = atan2(gps_base_y, gps_base_y);
+  // float rad = atan2(0.54381, -0.455);
+  // ROS_INFO("%f %f", rad, gps_th);
+  double th_gps_odom = 0.0;
+  if (gps_th < 0)
+  {
+    th_gps_odom = rad + gps_th;
+  } else if(gps_th > 0) {
+    th_gps_odom = (rad + gps_th) - 6.2831852;
+  }
+  
+  double cos_x = cos(th_gps_odom) * 0.709;
+  double sin_y = sin(th_gps_odom) * 0.709;
+
+  double cos_x_init, sin_y_init;
+  if(!init_diff_) {
+    cos_x_init = cos_x; 
+    sin_y_init = sin_y; 
+    init_diff_ = true;
+  }
+  double x = gps_x - cos_x + cos_x_init;//- nmea_rt.getOrigin().getX();
+  double y = gps_y - sin_y + sin_y_init;//- nmea_rt.getOrigin().getY();
   double z = gps_z ;//- nmea_rt.getOrigin().getZ();
   double th = gps_th;
   
@@ -194,9 +216,12 @@ void NmeaToOdomNode::NmeaCallBack(const sensor_msgs::NavSatFix::ConstPtr &gps,
     odom_broadcaster_.sendTransform(odom_trans);
   }
 
+  //next, we'll publish the odometry message over ROS
   nav_msgs::Odometry odom;
   odom.header.stamp = now_time;
   odom.header.frame_id = odom_frame_id_;
+
+  //set the position
   odom.pose.pose.position.x = x;
   odom.pose.pose.position.y = y;
   odom.pose.pose.position.z = 0.0;
@@ -204,6 +229,7 @@ void NmeaToOdomNode::NmeaCallBack(const sensor_msgs::NavSatFix::ConstPtr &gps,
   odom.pose.pose.orientation.y = odom_quat.y();
   odom.pose.pose.orientation.z = odom_quat.z();
   odom.pose.pose.orientation.w = odom_quat.w();
+  //odom.pose.pose.orientation = odom_quat;
   odom.pose.covariance = pose_covariance_;
   //set the velocity
   odom.child_frame_id = base_frame_id_;
